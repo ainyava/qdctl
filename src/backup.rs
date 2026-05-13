@@ -7,6 +7,7 @@ use apache_avro::{Schema, Writer};
 use qdrant_client::qdrant::{
     point_id::PointIdOptions, value::Kind,
     vector_output::Vector as VectorOutputKind,
+    vectors_config::Config as VectorsConfigKind,
     vectors_output::VectorsOptions, ScrollPointsBuilder,
     with_payload_selector::SelectorOptions as PayloadSelectorOptions,
     with_vectors_selector::SelectorOptions as VectorSelectorOptions,
@@ -19,15 +20,43 @@ use crate::avro_schema::POINT_SCHEMA;
 pub async fn run(
     url: &str,
     api_key: Option<&str>,
-    collection: &str,
+    collection: Option<&str>,
     output_dir: &str,
     batch_size: u32,
 ) -> Result<()> {
     let client = build_client(url, api_key)?;
 
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("Failed to create output directory: {output_dir}"))?;
+    match collection {
+        Some(name) => {
+            fs::create_dir_all(output_dir)
+                .with_context(|| format!("Failed to create output directory: {output_dir}"))?;
+            backup_collection(&client, name, output_dir, batch_size).await
+        }
+        None => {
+            let resp = client
+                .list_collections()
+                .await
+                .context("Failed to list collections")?;
+            let names: Vec<String> = resp.collections.into_iter().map(|c| c.name).collect();
+            println!("Found {} collection(s)", names.len());
+            for name in &names {
+                let dir = Path::new(output_dir).join(name);
+                println!("Backing up '{name}' → {}", dir.display());
+                fs::create_dir_all(&dir)
+                    .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+                backup_collection(&client, name, dir.to_str().unwrap(), batch_size).await?;
+            }
+            Ok(())
+        }
+    }
+}
 
+async fn backup_collection(
+    client: &Qdrant,
+    collection: &str,
+    output_dir: &str,
+    batch_size: u32,
+) -> Result<()> {
     let info_resp = client
         .collection_info(collection)
         .await
@@ -39,11 +68,8 @@ pub async fn run(
 
     let metadata = build_metadata(collection, &collection_info);
     let metadata_path = Path::new(output_dir).join("metadata.json");
-    fs::write(
-        &metadata_path,
-        serde_json::to_string_pretty(&metadata)?,
-    )
-    .with_context(|| format!("Failed to write metadata to {}", metadata_path.display()))?;
+    fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)
+        .with_context(|| format!("Failed to write metadata to {}", metadata_path.display()))?;
     println!("Wrote metadata → {}", metadata_path.display());
 
     let schema = Schema::parse_str(POINT_SCHEMA)?;
@@ -102,14 +128,52 @@ fn build_metadata(
     collection: &str,
     info: &qdrant_client::qdrant::CollectionInfo,
 ) -> serde_json::Value {
-    let config_debug = format!("{:?}", info.config);
     json!({
         "collection_name": collection,
         "points_count": info.points_count,
         "indexed_vectors_count": info.indexed_vectors_count,
         "segments_count": info.segments_count,
-        "config_debug": config_debug,
+        "config_debug": format!("{:?}", info.config),
+        "vectors_config": extract_vectors_config(info),
     })
+}
+
+fn extract_vectors_config(info: &qdrant_client::qdrant::CollectionInfo) -> JsonValue {
+    let vc = info.config.as_ref()
+        .and_then(|c| c.params.as_ref())
+        .and_then(|p| p.vectors_config.as_ref());
+
+    match vc.and_then(|v| v.config.as_ref()) {
+        Some(VectorsConfigKind::Params(vp)) => json!({
+            "type": "single",
+            "params": vp_to_json(vp),
+        }),
+        Some(VectorsConfigKind::ParamsMap(pm)) => {
+            let named: serde_json::Map<String, JsonValue> = pm
+                .map
+                .iter()
+                .map(|(name, vp)| (name.clone(), vp_to_json(vp)))
+                .collect();
+            json!({"type": "named", "params": named})
+        }
+        None => JsonValue::Null,
+    }
+}
+
+fn vp_to_json(vp: &qdrant_client::qdrant::VectorParams) -> JsonValue {
+    let mut obj = serde_json::Map::new();
+    obj.insert("size".to_string(), json!(vp.size));
+    obj.insert("distance".to_string(), json!(vp.distance));
+    if let Some(on_disk) = vp.on_disk {
+        obj.insert("on_disk".to_string(), json!(on_disk));
+    }
+    if let Some(dt) = vp.datatype {
+        obj.insert("datatype".to_string(), json!(dt));
+    }
+    if let Some(mvc) = &vp.multivector_config {
+        obj.insert("multivector_comparator".to_string(), json!(mvc.comparator));
+    }
+    JsonValue::Object(obj)
 }
 
 fn point_to_avro_record(

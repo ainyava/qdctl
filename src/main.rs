@@ -27,12 +27,12 @@ enum Command {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Collection name to back up
+        /// Collection name to back up (omit to back up all collections into subdirectories)
         #[arg(long)]
-        collection: String,
+        collection: Option<String>,
 
         /// Output directory (will be created if it doesn't exist)
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = "backup", env = "QDCTL_OUTPUT_DIR")]
         output_dir: String,
 
         /// Number of points to fetch per scroll request
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
             backup::run(
                 &url,
                 api_key.as_deref(),
-                &collection,
+                collection.as_deref(),
                 &output_dir,
                 batch_size,
             )

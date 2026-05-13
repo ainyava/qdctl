@@ -5,9 +5,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use apache_avro::{from_value, Reader, Schema};
 use qdrant_client::qdrant::{
-    point_id::PointIdOptions, value::Kind, vector::Vector as VectorKind, vectors::VectorsOptions,
-    DenseVector, NamedVectors, PointId, PointStruct, SparseVector, UpsertPointsBuilder,
-    Value as QdrantValue, Vector, Vectors,
+    point_id::PointIdOptions, value::Kind, vector::Vector as VectorKind,
+    vectors::VectorsOptions, vectors_config,
+    CreateCollectionBuilder, DenseVector, NamedVectors, PointId, PointStruct,
+    SparseVector, UpsertPointsBuilder, Value as QdrantValue, Vector, VectorParams,
+    Vectors, VectorsConfig, VectorParamsMap,
 };
 use qdrant_client::Qdrant;
 use serde::Deserialize;
@@ -34,21 +36,64 @@ pub async fn run(
 ) -> Result<()> {
     let client = build_client(url, api_key)?;
 
-    let metadata_path = Path::new(input_dir).join("metadata.json");
+    if let Some(name) = collection_override {
+        restore_dir(&client, input_dir, name, batch_size, create_if_missing).await
+    } else {
+        let subdirs = find_collection_dirs(input_dir)?;
+        if subdirs.is_empty() {
+            let name = read_collection_name(input_dir)?;
+            restore_dir(&client, input_dir, &name, batch_size, create_if_missing).await
+        } else {
+            println!("Found {} collection backup(s)", subdirs.len());
+            for (dir, name) in &subdirs {
+                println!("Restoring '{name}' ← {}", dir.display());
+                restore_dir(&client, dir.to_str().unwrap(), name, batch_size, create_if_missing)
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn find_collection_dirs(input_dir: &str) -> Result<Vec<(std::path::PathBuf, String)>> {
+    let mut results = Vec::new();
+    let entries = fs::read_dir(input_dir)
+        .with_context(|| format!("Cannot read directory: {input_dir}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && path.join("metadata.json").exists()
+            && path.join("points.avro").exists()
+        {
+            let name = read_collection_name(path.to_str().unwrap())?;
+            results.push((path, name));
+        }
+    }
+    results.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(results)
+}
+
+fn read_collection_name(dir: &str) -> Result<String> {
+    let metadata_path = Path::new(dir).join("metadata.json");
     let metadata: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(&metadata_path)
             .with_context(|| format!("Cannot read {}", metadata_path.display()))?,
     )?;
-
-    let collection = collection_override
+    metadata["collection_name"]
+        .as_str()
         .map(|s| s.to_string())
-        .or_else(|| metadata["collection_name"].as_str().map(|s| s.to_string()))
-        .context(
-            "No collection name: pass --collection or ensure metadata.json has 'collection_name'",
-        )?;
+        .context("No collection name: pass --collection or ensure metadata.json has 'collection_name'")
+}
 
+async fn restore_dir(
+    client: &Qdrant,
+    input_dir: &str,
+    collection: &str,
+    batch_size: usize,
+    create_if_missing: bool,
+) -> Result<()> {
     if create_if_missing {
-        ensure_collection(&client, &collection).await?;
+        ensure_collection(client, collection, input_dir).await?;
     }
 
     let avro_path = Path::new(input_dir).join("points.avro");
@@ -69,7 +114,7 @@ pub async fn run(
 
         if batch.len() >= batch_size {
             let n = batch.len() as u64;
-            upsert_batch(&client, &collection, std::mem::take(&mut batch)).await?;
+            upsert_batch(client, collection, std::mem::take(&mut batch)).await?;
             total += n;
             print!("\rRestored {total} points...");
             use std::io::Write;
@@ -79,7 +124,7 @@ pub async fn run(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        upsert_batch(&client, &collection, batch).await?;
+        upsert_batch(client, collection, batch).await?;
         total += n;
     }
 
@@ -95,19 +140,88 @@ fn build_client(url: &str, api_key: Option<&str>) -> Result<Qdrant> {
     Ok(builder.build()?)
 }
 
-async fn ensure_collection(client: &Qdrant, collection: &str) -> Result<()> {
+async fn ensure_collection(client: &Qdrant, collection: &str, dir: &str) -> Result<()> {
     match client.collection_info(collection).await {
         Ok(_) => {
             println!("Collection '{collection}' already exists, skipping creation.");
+            Ok(())
         }
-        Err(_) => {
-            anyhow::bail!(
-                "Collection '{collection}' does not exist. \
-                 Create it first via the Qdrant API or dashboard, \
-                 then retry restore (the config is in metadata.json under 'config_debug')."
-            );
-        }
+        Err(_) => create_collection_from_metadata(client, collection, dir).await,
     }
+}
+
+fn json_to_vector_params(vp: &JsonValue) -> Result<VectorParams> {
+    use qdrant_client::qdrant::MultiVectorConfig;
+    let size = vp["size"].as_u64().context("vector params missing 'size'")?;
+    let distance = vp["distance"].as_i64().unwrap_or(0) as i32;
+    let on_disk = vp["on_disk"].as_bool();
+    let datatype = vp["datatype"].as_i64().map(|d| d as i32);
+    let multivector_config = vp["multivector_comparator"]
+        .as_i64()
+        .map(|c| MultiVectorConfig { comparator: c as i32 });
+    Ok(VectorParams {
+        size,
+        distance,
+        on_disk,
+        datatype,
+        multivector_config,
+        ..Default::default()
+    })
+}
+
+async fn create_collection_from_metadata(
+    client: &Qdrant,
+    collection: &str,
+    dir: &str,
+) -> Result<()> {
+    let metadata_path = Path::new(dir).join("metadata.json");
+    let metadata: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("Cannot read {}", metadata_path.display()))?,
+    )?;
+
+    let vc_json = &metadata["vectors_config"];
+    anyhow::ensure!(
+        !vc_json.is_null(),
+        "Cannot auto-create '{collection}': metadata.json has no 'vectors_config' \
+         (re-run backup to capture it, or create the collection manually from 'config_debug')"
+    );
+
+    let vc_type = vc_json["type"]
+        .as_str()
+        .context("vectors_config.type missing")?;
+
+    let vectors_config = match vc_type {
+        "single" => {
+            // "params" key is the new format; fall back to root for old format
+            let vp_json = if vc_json["params"].is_object() { &vc_json["params"] } else { vc_json };
+            VectorsConfig {
+                config: Some(vectors_config::Config::Params(json_to_vector_params(vp_json)?)),
+            }
+        }
+        "named" => {
+            let params_obj = vc_json["params"]
+                .as_object()
+                .context("vectors_config.params missing for named vectors")?;
+            let map: HashMap<String, VectorParams> = params_obj
+                .iter()
+                .map(|(name, vp)| json_to_vector_params(vp).map(|p| (name.clone(), p)))
+                .collect::<Result<_>>()?;
+            VectorsConfig {
+                config: Some(vectors_config::Config::ParamsMap(VectorParamsMap { map })),
+            }
+        }
+        other => anyhow::bail!("Unknown vectors_config type: {other}"),
+    };
+
+    client
+        .create_collection(
+            CreateCollectionBuilder::new(collection).vectors_config(vectors_config),
+        )
+        .await
+        .with_context(|| format!("Failed to create collection '{collection}'"))?;
+
+    println!("Created collection '{collection}'.");
     Ok(())
 }
 
