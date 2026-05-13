@@ -15,7 +15,6 @@ RUN apt-get update && apt-get install -y ca-certificates curl unzip tar && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/qdctl /usr/local/bin/qdctl
-COPY scripts/backup-to-s3.sh /usr/local/bin/backup-to-s3.sh
+COPY scripts/*.sh /usr/local/bin/
 
-RUN chmod +x /usr/local/bin/backup-to-s3.sh
-ENTRYPOINT ["/usr/local/bin/backup-to-s3.sh"]
+RUN chmod +x /usr/local/bin/*.sh
